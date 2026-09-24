@@ -8,12 +8,13 @@ const readStore = () => { try { return JSON.parse(fs.readFileSync(STORE, 'utf8')
 const before = readStore();
 
 process.env.PI_RECAP_DEBOUNCE_MS = '500';
-const child = spawn('pi', ['--mode', 'rpc', '--model', 'xiaomi-token-plan-cn/mimo-v2.6-flash'], {
-  cwd: os.tmpdir() + '/pi-recap-live',
-  shell: true,
+const workdir = os.tmpdir() + '/pi-recap-live';
+fs.mkdirSync(workdir, { recursive: true });
+const cliPath = 'C:/Users/yyp/AppData/Roaming/npm/node_modules/@earendil-works/pi-coding-agent/dist/cli.js';
+const child = spawn(process.execPath, [cliPath, '--mode', 'rpc', '--model', 'xiaomi-token-plan-cn/mimo-v2.6-flash'], {
+  cwd: workdir,
   stdio: ['pipe', 'pipe', 'pipe'],
 });
-fs.mkdirSync(os.tmpdir() + '/pi-recap-live', { recursive: true });
 
 let buf = '';
 const uiRequests = [];
