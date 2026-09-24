@@ -12,7 +12,8 @@ pi coding agent 的**轻量会话小结**扩展（对标 Claude Code 的 Recap�
 | 不读历史全量 | 总结输入固定为「上一次小结 + 本轮用户输入 / 工具动作 / 助手产出」，各截断 400 字（≈几百 token） |
 | 少费 token | 每轮仅 1 次廉价模型调用（标签和 recap 共享），输出 ≤150 token；`/recap` 展示与 resume 恢复**零 token**（读磁盘缓存） |
 | 不污染任务上下文 | 总结走独立裸模型调用（`ctx.modelRegistry.complete`），不写 session 文件、不进 LLM 上下文 |
-| 不打扰 | 失败/无模型时本地兜底（取本轮用户输入第一句），不报错、不阻塞 |
+| 不打扰 | 失败/无模型/**调用挂死**（硬看门狗强制收尾 + abort 请求）时本地兜底（取本轮材料第一句），不报错、不阻塞、后台不留孤儿请求 |
+| 不反复请求 | 调用串行 + 意图合并（进行中再刷最多补一次）+ 自动刷新防抖（1.2s，环境变量 `PI_RECAP_DEBOUNCE_MS` 可调）；无新材料的 `/recap` 零调用 |
 
 ## 安装
 
@@ -46,7 +47,18 @@ pi install git:github.com/SomeTestZero/pi-lite-recap
 
 - `SUMMARY_CANDIDATES`：总结用廉价模型候选（按顺序取第一个已配认证的），默认 `xiaomi-token-plan-cn/mimo-v2.6-flash` → `neu-llm-gateway/qwen3.8-flash-next` → `deepseek/deepseek-flash`，兜底用当前会话模型。
 - `MAX_SUMMARY_CHARS` / `MAX_RECAP_LINE_CHARS`：标签短语 / recap 行的字符上限（默认 18 / 25，按标签宽度调）。
-- `MAX_EXCERPT` / `MAX_OUTPUT_TOKENS` / `SUMMARY_TIMEOUT_MS`：材料截断、输出上限、超时。
+- `MAX_EXCERPT` / `MAX_OUTPUT_TOKENS` / `SUMMARY_TIMEOUT_MS`：材料截断、输出上限、HTTP 超时。
+- 环境变量：`PI_RECAP_HARD_TIMEOUT_MS`（硬看门狗，默认 35s）、`PI_RECAP_DEBOUNCE_MS`（自动刷新防抖，默认 1.2s）。
+
+## 测试
+
+```bash
+# 回归测试：强刷意图/回调不丢、挂死看门狗、无新材料零调用（打桩，不联网）
+node --experimental-strip-types test/repro-bugs.mjs
+
+# 真机联调（可选）：pi --mode rpc 跑一轮极小对话，验证真实模型调用只发一次
+node --experimental-strip-types test/live-rpc.mjs
+```
 
 ## 产物示例
 

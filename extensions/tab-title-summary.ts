@@ -12,12 +12,20 @@
  * 关键口径：
  * - 「新会话」= ctx.modelRegistry.complete() 的裸模型调用：messages 只含本次
  *   摘要材料，不写入当前 session 文件、不进 LLM 上下文，对进行中的任务零污染。
- * - 只 recap「最近」：喂给总结模型的材料固定为「上一次状态 + 本轮用户输入 +
+ * - 只 recap「最近」：喂给总结模型的材料固定为「上一次小结 + 本轮用户输入 +
  *   工具动作 + 助手产出」各截断 400 字（≈几百 token），永远不读历史全量；
  *   输出限 150 token。对标 Claude Code recap 的全会话总结，这里刻意做轻。
  * - 滚动更新：每轮把上一次状态带上，三行随最新进展漂移（整体任务不丢）。
- * - 兜底：无可用模型 / 调用失败时，用本轮用户输入的第一句做本地启发式短语，
- *   标签照样更新，不阻塞、不报错打扰。
+ * - 兜底：无可用模型 / 调用失败 / 调用挂死（硬看门狗强制收尾并 abort 请求）时，
+ *   用本轮材料做本地启发式小结，标签照样更新，不阻塞、不报错打扰。
+ *
+ * 并发与节流口径（防「一直刷新中」/ 反复请求烧 token）：
+ * - 调用串行；进行中收到刷新请求只置合并标记（强刷意图不丢），收尾后补至多一次。
+ * - 回调在刷新链最终收尾时必定触发，任何早退路径都不吞回调。
+ * - 材料桶带版本号：调用期间新到的材料不被误消费，留给下一次刷新。
+ * - 自动刷新防抖（AUTO_DEBOUNCE_MS）：一轮内连续多次 settle 合并成一次调用。
+ * - 双层超时：timeoutMs（HTTP）+ HARD_TIMEOUT_MS 硬看门狗（Promise.race + abort），
+ *   complete() 永不返回也不会卡死或在后台留孤儿请求。
  *
  * 用法：
  *   /recap             展示「状态/做了/接下来」（面板），有新进展则顺手刷新
@@ -54,8 +62,12 @@ const MAX_RECAP_LINE_CHARS = 25;
 const MAX_EXCERPT = 400;
 /** 总结调用的输出上限（token） */
 const MAX_OUTPUT_TOKENS = 150;
-/** 总结调用超时（毫秒），失败直接走本地兜底 */
+/** 总结调用的 HTTP 超时（毫秒） */
 const SUMMARY_TIMEOUT_MS = 30_000;
+/** 硬看门狗（毫秒）：complete() 挂死也强制收尾 + abort 请求，绝不吊后台。环境变量 PI_RECAP_HARD_TIMEOUT_MS 可覆盖。 */
+const HARD_TIMEOUT_MS = Number(process.env.PI_RECAP_HARD_TIMEOUT_MS ?? SUMMARY_TIMEOUT_MS + 5_000);
+/** 自动刷新防抖（毫秒）：一轮内连续多次 settle 合并成一次调用。环境变量 PI_RECAP_DEBOUNCE_MS 可覆盖。 */
+const AUTO_DEBOUNCE_MS = Number(process.env.PI_RECAP_DEBOUNCE_MS ?? 1_200);
 /** 状态持久化文件（外部存储，不进任何会话上下文） */
 const STORE_FILE = path.join(
 	process.env.PI_CODING_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent"),
@@ -112,10 +124,23 @@ function cleanPhrase(text: string): string {
 		.replace(/[」』"'”’`）)\]。！？!?；;：:，,、\s]+$/, "");
 }
 
+/** 取第一句并清洗 */
+function firstSentence(text: string): string {
+	return cleanPhrase(text.split(/[。！？!?\n]/)[0] ?? "");
+}
+
 /** 本地兜底短语：取本轮用户输入的第一句 */
 function heuristicSummary(userText: string): string {
-	const first = cleanPhrase(userText.split(/[。！？!?\n]/)[0] ?? "");
-	return clip(first || "对话中", MAX_SUMMARY_CHARS);
+	return clip(firstSentence(userText) || "对话中", MAX_SUMMARY_CHARS);
+}
+
+/** 本地兜底小结：模型不可用/挂死时也能更新标签和面板（did 从助手产出取一句） */
+function fallbackRecap(round: RoundDigest): Recap {
+	return {
+		label: heuristicSummary(round.userTexts[0] ?? ""),
+		did: round.assistantText ? clip(firstSentence(round.assistantText), MAX_RECAP_LINE_CHARS) : "",
+		next: "",
+	};
 }
 
 // ============================== 持久化 ==============================
@@ -129,7 +154,7 @@ function loadStore(): RecapStore {
 	try {
 		const raw = JSON.parse(fs.readFileSync(STORE_FILE, "utf8")) as RecapStore;
 		// 兼容旧版只有 { summary } 的记录
-		for (const [key, rec] of Object.entries(raw)) {
+		for (const rec of Object.values(raw)) {
 			if (!rec.label && (rec as unknown as { summary?: string }).summary) {
 				rec.label = (rec as unknown as { summary?: string }).summary ?? "";
 			}
@@ -233,38 +258,52 @@ function pickSummaryModel(ctx: ExtensionContext) {
 	return undefined;
 }
 
-/** 独立上下文的裸模型调用：一问一答，不进任何会话 */
+/** 独立上下文的裸模型调用：一问一答，不进任何会话。双层超时 + abort，绝不吊后台。 */
 async function callSummaryModel(ctx: ExtensionContext, prompt: string): Promise<Recap | undefined> {
 	const model = pickSummaryModel(ctx);
 	if (!model) return undefined;
+	const ac = new AbortController();
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const hardStop = new Promise<undefined>((resolve) => {
+		timer = setTimeout(() => {
+			ac.abort(); // 中断挂起的 HTTP 请求，不留后台孤儿
+			resolve(undefined);
+		}, HARD_TIMEOUT_MS);
+	});
 	try {
-		const response = await ctx.modelRegistry.complete(
-			model,
-			{
-				messages: [
-					{
-						role: "user",
-						content: [{ type: "text", text: prompt }],
-						timestamp: Date.now(),
-					},
-				],
-			},
-			{
-				maxTokens: MAX_OUTPUT_TOKENS,
-				temperature: 0.2,
-				cacheRetention: "none",
-				maxRetries: 0,
-				timeoutMs: SUMMARY_TIMEOUT_MS,
-				sessionId: `${ctx.sessionManager.getSessionId()}-tabtitle`,
-			},
-		);
-		const text = response.content
-			.filter((c): c is { type: "text"; text: string } => c.type === "text")
-			.map((c) => c.text)
-			.join("\n");
-		return parseRecap(text);
+		const call = (async () => {
+			const response = await ctx.modelRegistry.complete(
+				model,
+				{
+					messages: [
+						{
+							role: "user",
+							content: [{ type: "text", text: prompt }],
+							timestamp: Date.now(),
+						},
+					],
+				},
+				{
+					maxTokens: MAX_OUTPUT_TOKENS,
+					temperature: 0.2,
+					cacheRetention: "none",
+					maxRetries: 0,
+					timeoutMs: SUMMARY_TIMEOUT_MS,
+					signal: ac.signal,
+					sessionId: `${ctx.sessionManager.getSessionId()}-tabtitle`,
+				},
+			);
+			const text = response.content
+				.filter((c): c is { type: "text"; text: string } => c.type === "text")
+				.map((c) => c.text)
+				.join("\n");
+			return parseRecap(text);
+		})();
+		return await Promise.race([call, hardStop]);
 	} catch {
 		return undefined;
+	} finally {
+		if (timer) clearTimeout(timer);
 	}
 }
 
@@ -278,8 +317,10 @@ export default function (pi: ExtensionAPI) {
 	let enabled = true; // /tabtitle off 可关
 	let alive = true; // session_shutdown 后停止一切异步收尾
 	let summarizing = false; // 总结调用串行化
-	let refreshQueued = false; // 总结进行中又来一轮 → 收尾后再刷一次
+	let queuedForce = false; // 调用进行中收到的强刷意图（收尾后必须补刷，不许被吞）
+	let digestVersion = 0; // 材料桶版本号：调用期间新到的材料不能被误消费
 	let dirty = false; // 本轮是否有新材料（无新材料不调模型）
+	let autoTimer: ReturnType<typeof setTimeout> | undefined; // 自动刷新防抖
 	const doneCallbacks: Array<() => void> = []; // 刷新收尾回调（/recap 等展示用）
 	const reassertTimers: Array<ReturnType<typeof setTimeout>> = [];
 
@@ -313,52 +354,72 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
-	/** 串行的刷新入口：一轮结束后调用；onDone 在本次（或被合并的后续）刷新收尾后回调 */
-	const refresh = (ctx: ExtensionContext, force = false, onDone?: () => void) => {
-		if (!enabled) {
-			onDone?.();
-			return;
+	// —— 刷新链：串行 + 意图合并 + 回调必达 ——
+
+	const flushDone = () => {
+		for (const cb of doneCallbacks.splice(0)) {
+			try {
+				cb();
+			} catch {
+				// 回调异常不影响主流程
+			}
 		}
-		if (summarizing) {
-			refreshQueued = true;
-			if (onDone) doneCallbacks.push(onDone);
-			return;
-		}
-		if (!force && !dirty) {
-			onDone?.();
-			return;
-		}
-		if (onDone) doneCallbacks.push(onDone);
+	};
+
+	const runRefresh = (ctx: ExtensionContext) => {
 		summarizing = true;
+		queuedForce = false; // 本次调用已兑现；调用期间再来强刷会重新置位
+		const consumedVersion = digestVersion;
 		void (async () => {
 			try {
 				const prompt = buildSummaryPrompt(recap, round);
-				const next =
-					(await callSummaryModel(ctx, prompt)) ??
-					({ label: heuristicSummary(round.userTexts[0] ?? ""), did: "", next: "" } as Recap);
-				if (alive && next) {
+				const next = (await callSummaryModel(ctx, prompt)) ?? fallbackRecap(round);
+				if (alive) {
 					recap = next;
-					dirty = false;
-					round = EMPTY_ROUND(); // 本轮材料消费掉，下轮从头攒
+					// 只消费本次调用覆盖的材料；调用期间新到的留给下一次刷新
+					if (digestVersion === consumedVersion) {
+						round = EMPTY_ROUND();
+						dirty = false;
+					}
 					persist(ctx.sessionManager.getSessionId());
 					paint(ctx);
 				}
+			} catch {
+				// 内部已有兜底，这里只是保险，绝不出未处理拒绝
 			} finally {
 				summarizing = false;
-				if (refreshQueued && alive) {
-					refreshQueued = false;
-					refresh(ctx); // doneCallbacks 留给合并后的这轮收尾
+				if (alive && (queuedForce || dirty)) {
+					runRefresh(ctx); // 合并后的补刷，回调留给它收尾
 				} else {
-					for (const cb of doneCallbacks.splice(0)) {
-						try {
-							cb();
-						} catch {
-							// 回调异常不影响主流程
-						}
-					}
+					flushDone();
 				}
 			}
 		})();
+	};
+
+	/** 刷新入口：onDone 在刷新链最终收尾后必定回调（任何早退路径都不吞回调） */
+	const refresh = (ctx: ExtensionContext, force = false, onDone?: () => void) => {
+		if (onDone) doneCallbacks.push(onDone);
+		if (!enabled) {
+			flushDone();
+			return;
+		}
+		if (force) queuedForce = true;
+		if (summarizing) return; // 在飞的调用收尾时统一补刷/flush，意图与回调都不丢
+		if (!queuedForce && !dirty) {
+			flushDone(); // 无可做：回调也必须触发
+			return;
+		}
+		runRefresh(ctx);
+	};
+
+	/** 自动刷新（agent_settled）：防抖合并一轮内多次 settle，省调用 */
+	const scheduleAutoRefresh = (ctx: ExtensionContext) => {
+		if (autoTimer) clearTimeout(autoTimer);
+		autoTimer = setTimeout(() => {
+			autoTimer = undefined;
+			if (alive) refresh(ctx);
+		}, AUTO_DEBOUNCE_MS);
 	};
 
 	// —— 事件接线 ——
@@ -369,6 +430,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (event, ctx) => {
 		alive = true;
 		round = EMPTY_ROUND();
+		digestVersion = 0;
 		dirty = false;
 		busy = false;
 		recap = loadStore()[ctx.sessionManager.getSessionId()];
@@ -394,31 +456,38 @@ export default function (pi: ExtensionAPI) {
 			if (text && round.userTexts.length < 3) {
 				round.userTexts.push(text);
 				dirty = true;
+				digestVersion++;
 			}
 		} else if (msg.role === "assistant") {
 			const text = extractText(msg.content).trim();
 			if (text) {
 				round.assistantText = text; // 只留最新一份产出 = 「最近」在做什么
 				dirty = true;
+				digestVersion++;
 			}
 			for (const hint of extractToolHints(msg.content)) {
 				round.tools.push(hint);
 				dirty = true;
+				digestVersion++;
 			}
 			if (round.tools.length > 16) round.tools = round.tools.slice(-16);
 		}
 	});
 
-	// 一轮大的用户级对话结束 → 滚动刷新（标签 + Recap 同源产物）
+	// 一轮大的用户级对话结束 → 防抖后滚动刷新（标签 + Recap 同源产物）
 	pi.on("agent_settled", (_event, ctx) => {
 		busy = false;
 		paint(ctx);
-		refresh(ctx);
+		scheduleAutoRefresh(ctx);
 	});
 
-	// 收尾：停掉延时重申，异步收尾一律不再动 UI/存储
+	// 收尾：停掉延时重申与防抖 timer，异步收尾一律不再动 UI/存储
 	pi.on("session_shutdown", (_event, ctx) => {
 		alive = false;
+		if (autoTimer) {
+			clearTimeout(autoTimer);
+			autoTimer = undefined;
+		}
 		for (const t of reassertTimers) clearTimeout(t);
 		reassertTimers.length = 0;
 		persist(ctx.sessionManager.getSessionId());
@@ -430,7 +499,7 @@ export default function (pi: ExtensionAPI) {
 		description: "轻量 Recap：状态/做了/接下来（/recap redo 强制刷新）",
 		handler: async (args, ctx) => {
 			const force = args.trim().toLowerCase() === "redo";
-			if (recap && !force && !dirty) {
+			if (recap && !force && !dirty && !summarizing && !queuedForce) {
 				showRecapPanel(ctx); // 零 token：直接读缓存
 				return;
 			}
@@ -459,7 +528,11 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (arg) {
-				recap = { label: clip(cleanPhrase(arg), MAX_SUMMARY_CHARS), did: recap?.did ?? "", next: recap?.next ?? "" };
+				recap = {
+					label: clip(cleanPhrase(arg), MAX_SUMMARY_CHARS),
+					did: recap?.did ?? "",
+					next: recap?.next ?? "",
+				};
 				dirty = false;
 				round = EMPTY_ROUND();
 				persist(sessionId);
