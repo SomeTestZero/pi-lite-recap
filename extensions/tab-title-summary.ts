@@ -1,21 +1,24 @@
 /**
- * tab-title-summary —— 会话状态上标签 + 轻量 Recap
+ * tab-title-summary —— 会话主题/状态上标签 + 轻量 Recap
  *
  * 场景：Windows Terminal 开了很多标签，每个标签跑一个 pi 在干不同的事，
  * 标签页只显示 pi 默认标题，看不出各自在干嘛；隔一会回来也忘了该接着干什么。
  *
  * 两个功能，共享同一次极小的模型调用（每轮大的用户级对话结束时触发）：
- * 1. 标签状态短语：≤18 字中文短语 → ctx.ui.setTitle() → WT 标签页可见。
+ * 1. 标签 = 「主题 · 最近」：主题（会话主线，粘性稳定）+ 状态短语（最近在做什么，
+ *    滚动漂移）→ ctx.ui.setTitle() → WT 标签页一眼看出这个会话是干什么的、干到哪了。
  * 2. 轻量 Recap：同一调用顺带产出「做了 / 接下来」两行短句，缓存到磁盘，
  *    /recap 或会话恢复时直接展示（展示本身零 token）。
  *
  * 关键口径：
  * - 「新会话」= ctx.modelRegistry.complete() 的裸模型调用：messages 只含本次
  *   摘要材料，不写入当前 session 文件、不进 LLM 上下文，对进行中的任务零污染。
- * - 只 recap「最近」：喂给总结模型的材料固定为「上一次小结 + 本轮用户输入 +
- *   工具动作 + 助手产出」各截断 400 字（≈几百 token），永远不读历史全量；
- *   输出限 150 token。对标 Claude Code recap 的全会话总结，这里刻意做轻。
- * - 滚动更新：每轮把上一次状态带上，三行随最新进展漂移（整体任务不丢）。
+ * - 只 recap「最近」：喂给总结模型的材料固定为「上一次小结 + 会话开题（首条用户
+ *   输入 80 字，只用来定主题）+ 本轮用户输入/工具动作/助手产出（各截断 400 字）」，
+ *   永远不读历史全量；输出限 200 token。
+ * - 主题粘性：prompt 要求沿用上一次小结的主题，解析时空主题自动继承旧值；
+ *   要换主题用 `/recap topic <文本>` 手动改（零 token，立即生效）。
+ * - 滚动更新：每轮把上一次小结带上，三行随最新进展漂移（整体任务不丢）。
  * - 兜底：无可用模型 / 调用失败 / 调用挂死（硬看门狗强制收尾并 abort 请求）时，
  *   用本轮材料做本地启发式小结，标签照样更新，不阻塞、不报错打扰。
  *
@@ -28,11 +31,12 @@
  *   complete() 永不返回也不会卡死或在后台留孤儿请求。
  *
  * 用法：
- *   /recap             展示「状态/做了/接下来」（面板），有新进展则顺手刷新
- *   /recap redo        强制重新总结一次
- *   /tabtitle          查看当前状态短语并刷新
- *   /tabtitle 修复渲染页  手动设置状态短语（跳过模型调用）
- *   /tabtitle off|on   关闭/恢复自动刷新
+ *   /recap                展示「主题/状态/做了/接下来」（面板），有新进展则顺手刷新
+ *   /recap redo           强制重新总结一次
+ *   /recap topic 插件开发  手动设置会话主题（零 token，立即生效）
+ *   /tabtitle             查看当前状态短语并刷新
+ *   /tabtitle 修复渲染页    手动设置状态短语（跳过模型调用）
+ *   /tabtitle off|on      关闭/恢复自动刷新
  *
  * 安装/重载：
  *   pi install git:github.com/SomeTestZero/pi-lite-recap   （或 git:git@github.com:SomeTestZero/pi-lite-recap.git）
@@ -54,14 +58,18 @@ const SUMMARY_CANDIDATES: Array<[provider: string, modelId: string]> = [
 	["deepseek", "deepseek-flash"],
 ];
 
-/** 标签页宽度有限，状态短语硬上限（字符数，中文按 1 算） */
+/** 会话主题硬上限（字符数，中文按 1 算） */
+const MAX_TOPIC_CHARS = 14;
+/** 标签页宽度有限，状态短语硬上限 */
 const MAX_SUMMARY_CHARS = 18;
 /** Recap「做了 / 接下来」两行的硬上限 */
 const MAX_RECAP_LINE_CHARS = 25;
 /** 摘要材料各字段截断长度（省 token） */
 const MAX_EXCERPT = 400;
+/** 会话开题（首条用户输入）截断长度：只用来定主题 */
+const MAX_OPENING_CHARS = 80;
 /** 总结调用的输出上限（token） */
-const MAX_OUTPUT_TOKENS = 150;
+const MAX_OUTPUT_TOKENS = 200;
 /** 总结调用的 HTTP 超时（毫秒） */
 const SUMMARY_TIMEOUT_MS = 30_000;
 /** 硬看门狗（毫秒）：complete() 挂死也强制收尾 + abort 请求，绝不吊后台。环境变量 PI_RECAP_HARD_TIMEOUT_MS 可覆盖。 */
@@ -137,6 +145,7 @@ function heuristicSummary(userText: string): string {
 /** 本地兜底小结：模型不可用/挂死时也能更新标签和面板（did 从助手产出取一句） */
 function fallbackRecap(round: RoundDigest): Recap {
 	return {
+		topic: "",
 		label: heuristicSummary(round.userTexts[0] ?? ""),
 		did: round.assistantText ? clip(firstSentence(round.assistantText), MAX_RECAP_LINE_CHARS) : "",
 		next: "",
@@ -145,19 +154,20 @@ function fallbackRecap(round: RoundDigest): Recap {
 
 // ============================== 持久化 ==============================
 
-/** 一次滚动总结的产物：标签短语 + Recap 两行 */
-type Recap = { label: string; did: string; next: string };
+/** 一次滚动总结的产物：会话主题 + 标签短语 + Recap 两行 */
+type Recap = { topic: string; label: string; did: string; next: string };
 type RecapRecord = Recap & { updatedAt: number };
 type RecapStore = Record<string, RecapRecord>;
 
 function loadStore(): RecapStore {
 	try {
 		const raw = JSON.parse(fs.readFileSync(STORE_FILE, "utf8")) as RecapStore;
-		// 兼容旧版只有 { summary } 的记录
+		// 兼容旧版记录（无 topic / 旧字段 summary）
 		for (const rec of Object.values(raw)) {
 			if (!rec.label && (rec as unknown as { summary?: string }).summary) {
 				rec.label = (rec as unknown as { summary?: string }).summary ?? "";
 			}
+			rec.topic ??= "";
 			rec.label ??= "";
 			rec.did ??= "";
 			rec.next ??= "";
@@ -189,15 +199,23 @@ function dirBase(ctx: ExtensionContext): string {
 	return path.basename(ctx.cwd || process.cwd());
 }
 
-function buildTitle(ctx: ExtensionContext, label: string | undefined, busy: boolean): string {
+/**
+ * 标题格式：
+ *   有主题：`▶ 主题 · 最近`（主题即身份，省掉目录后缀，标签页最宽也认得出是谁）
+ *   无主题：`▶ 最近 · 目录`（兜底）
+ */
+function buildTitle(ctx: ExtensionContext, recap: Recap | undefined, busy: boolean): string {
 	const marker = busy ? "▶ " : "";
-	const body = label ? clip(cleanPhrase(label), MAX_SUMMARY_CHARS) : "π";
+	if (recap?.topic) {
+		return `${marker}${clip(cleanPhrase(recap.topic), MAX_TOPIC_CHARS)} · ${recap.label ? clip(cleanPhrase(recap.label), MAX_SUMMARY_CHARS) : "…"}`;
+	}
+	const body = recap?.label ? clip(cleanPhrase(recap.label), MAX_SUMMARY_CHARS) : "π";
 	return `${marker}${body} · ${dirBase(ctx)}`;
 }
 
-function applyTitle(ctx: ExtensionContext, label: string | undefined, busy: boolean): void {
+function applyTitle(ctx: ExtensionContext, recap: Recap | undefined, busy: boolean): void {
 	try {
-		ctx.ui.setTitle(buildTitle(ctx, label, busy));
+		ctx.ui.setTitle(buildTitle(ctx, recap, busy));
 	} catch {
 		// 无 UI（json/print 模式）时静默
 	}
@@ -214,30 +232,35 @@ type RoundDigest = {
 
 const EMPTY_ROUND = (): RoundDigest => ({ userTexts: [], assistantText: "", tools: [] });
 
-/** 拼出喂给总结模型的材料（全部截断，控制在 ~1k 字以内） */
-function buildSummaryPrompt(prev: Recap | undefined, round: RoundDigest): string {
+/** 拼出喂给总结模型的材料（全部截断，控制在 ~1.2k 字以内） */
+function buildSummaryPrompt(prev: Recap | undefined, round: RoundDigest, opening: string): string {
 	return [
-		"你在为一个编码会话做滚动小结，供终端标签和 Recap 面板使用。根据下面的材料（只含最近一轮），输出固定三行：",
-		`标签：<${MAX_SUMMARY_CHARS} 字以内的中文短语，动宾结构，写最近在做什么，例：修复渲染页崩溃>`,
+		"你在为一个编码会话做滚动小结，供终端标签和 Recap 面板使用。根据下面的材料（只含最近一轮），输出固定四行：",
+		`主题：<${MAX_TOPIC_CHARS} 字以内的名词短语，整个会话讨论/构建的主线对象，例：recap 插件、渲染页崩溃、数据导出>`,
+		`标签：<${MAX_SUMMARY_CHARS} 字以内的中文短语，动宾结构，写最近在做什么，例：修复卡死 bug>`,
 		`做了：<${MAX_RECAP_LINE_CHARS} 字以内，最近一轮完成了什么>`,
 		`接下来：<${MAX_RECAP_LINE_CHARS} 字以内，下一步该做什么；没有明确待办就写：继续当前任务>`,
-		"要求：每行以「标签：」「做了：」「接下来：」开头；不要引号、解释、理由、额外行。",
+		"要求：每行以「主题：」「标签：」「做了：」「接下来：」开头；不要引号、解释、理由、额外行。",
+		"主题口径：主题是会话身份，保持稳定，优先沿用上一次小结的主题；只有会话主线明显改变时才换新主题。",
 		"",
-		`上一次小结：${prev ? `标签 ${prev.label || "—"}；做了 ${prev.did || "—"}；接下来 ${prev.next || "—"}` : "（无）"}`,
+		`上一次小结：${prev ? `主题 ${prev.topic || "—"}；标签 ${prev.label || "—"}；做了 ${prev.did || "—"}；接下来 ${prev.next || "—"}` : "（无）"}`,
+		`会话开题（首条用户输入，仅供定主题）：${opening ? clip(opening, MAX_OPENING_CHARS) : "（无）"}`,
 		`本轮用户输入：${round.userTexts.map((t) => clip(t, MAX_EXCERPT)).join(" | ") || "（无）"}`,
 		`本轮工具动作：${round.tools.slice(-8).join(", ") || "（无）"}`,
 		`本轮助手产出：${clip(round.assistantText, MAX_EXCERPT) || "（无）"}`,
 	].join("\n");
 }
 
-/** 解析三行输出；模型偶尔不守格式时尽力回收，保底 label 非空 */
+/** 解析四行输出；模型偶尔不守格式时尽力回收，保底 label 非空 */
 function parseRecap(text: string): Recap | undefined {
-	const recap: Recap = { label: "", did: "", next: "" };
+	const recap: Recap = { topic: "", label: "", did: "", next: "" };
 	for (const line of text.split(/\r?\n/)) {
-		const m = /^\s*(标签|做了|接下来)\s*[:：]\s*(.+)$/.exec(line);
+		const m = /^\s*(主题|标签|做了|接下来)\s*[:：]\s*(.+)$/.exec(line);
 		if (!m) continue;
-		const value = clip(cleanPhrase(m[2] ?? ""), m[1] === "标签" ? MAX_SUMMARY_CHARS : MAX_RECAP_LINE_CHARS);
-		if (m[1] === "标签") recap.label = value;
+		const max = m[1] === "主题" ? MAX_TOPIC_CHARS : m[1] === "标签" ? MAX_SUMMARY_CHARS : MAX_RECAP_LINE_CHARS;
+		const value = clip(cleanPhrase(m[2] ?? ""), max);
+		if (m[1] === "主题") recap.topic = value;
+		else if (m[1] === "标签") recap.label = value;
 		else if (m[1] === "做了") recap.did = value;
 		else recap.next = value;
 	}
@@ -312,7 +335,8 @@ async function callSummaryModel(ctx: ExtensionContext, prompt: string): Promise<
 export default function (pi: ExtensionAPI) {
 	// —— 会话级状态 ——
 	let round: RoundDigest = EMPTY_ROUND();
-	let recap: Recap | undefined; // 当前小结（滚动）：标签 → 标题，三行 → Recap 面板
+	let recap: Recap | undefined; // 当前小结（滚动）：主题/标签 → 标题，四行 → Recap 面板
+	let sessionOpening = ""; // 首条用户输入（定主题用，截断 80 字）
 	let busy = false; // agent 是否在跑（标签加 ▶ 前缀）
 	let enabled = true; // /tabtitle off 可关
 	let alive = true; // session_shutdown 后停止一切异步收尾
@@ -331,14 +355,15 @@ export default function (pi: ExtensionAPI) {
 		saveStore(store);
 	};
 
-	const paint = (ctx: ExtensionContext) => applyTitle(ctx, recap?.label, busy);
+	const paint = (ctx: ExtensionContext) => applyTitle(ctx, recap, busy);
 
 	/** Recap 面板（aboveEditor 小组件），展示零 token */
 	const showRecapPanel = (ctx: ExtensionContext) => {
 		if (!ctx.hasUI || !recap) return;
 		const time = new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
 		ctx.ui.setWidget("recap", [
-			`● ${recap.label || "—"}`,
+			recap.topic ? `◎ 主题：${recap.topic}` : "◎ 主题：—",
+			`● 最近：${recap.label || "—"}`,
 			recap.did ? `✓ 做了：${recap.did}` : "✓ 做了：—",
 			recap.next ? `→ 接下来：${recap.next}` : "→ 接下来：—",
 			`（${time} 小结，/recap 刷新）`,
@@ -372,9 +397,11 @@ export default function (pi: ExtensionAPI) {
 		const consumedVersion = digestVersion;
 		void (async () => {
 			try {
-				const prompt = buildSummaryPrompt(recap, round);
+				const prompt = buildSummaryPrompt(recap, round, sessionOpening);
 				const next = (await callSummaryModel(ctx, prompt)) ?? fallbackRecap(round);
 				if (alive) {
+					// 主题粘性：模型没给主题就沿用旧主题（prompt 也要求稳定）
+					if (!next.topic && recap?.topic) next.topic = recap.topic;
 					recap = next;
 					// 只消费本次调用覆盖的材料；调用期间新到的留给下一次刷新
 					if (digestVersion === consumedVersion) {
@@ -430,6 +457,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (event, ctx) => {
 		alive = true;
 		round = EMPTY_ROUND();
+		sessionOpening = "";
 		digestVersion = 0;
 		dirty = false;
 		busy = false;
@@ -453,8 +481,9 @@ export default function (pi: ExtensionAPI) {
 		const msg = event.message as { role?: string; content?: unknown };
 		if (msg.role === "user") {
 			const text = cleanPhrase(extractText(msg.content));
-			if (text && round.userTexts.length < 3) {
-				round.userTexts.push(text);
+			if (text) {
+				if (!sessionOpening) sessionOpening = text; // 首条用户输入 → 定主题
+				if (round.userTexts.length < 3) round.userTexts.push(text);
 				dirty = true;
 				digestVersion++;
 			}
@@ -474,7 +503,7 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	// 一轮大的用户级对话结束 → 防抖后滚动刷新（标签 + Recap 同源产物）
+	// 一轮大的用户级对话结束 → 防抖后滚动刷新（标题 + Recap 同源产物）
 	pi.on("agent_settled", (_event, ctx) => {
 		busy = false;
 		paint(ctx);
@@ -496,9 +525,26 @@ export default function (pi: ExtensionAPI) {
 	// —— 命令 ——
 
 	pi.registerCommand("recap", {
-		description: "轻量 Recap：状态/做了/接下来（/recap redo 强制刷新）",
+		description: "轻量 Recap：主题/最近/做了/接下来（/recap redo 强刷，/recap topic <文本> 定主题）",
 		handler: async (args, ctx) => {
-			const force = args.trim().toLowerCase() === "redo";
+			const arg = args.trim();
+
+			// /recap topic <文本>：手动定/换主题（零 token，立即生效）
+			if (/^topic\b/i.test(arg)) {
+				const topic = clip(cleanPhrase(arg.replace(/^topic\b\s*/i, "")), MAX_TOPIC_CHARS);
+				if (!topic) {
+					if (ctx.hasUI) ctx.ui.notify(recap?.topic ? `当前主题：${recap.topic}` : "尚未设置主题（/recap topic <文本> 设置）", "info");
+					return;
+				}
+				recap = { topic, label: recap?.label ?? "", did: recap?.did ?? "", next: recap?.next ?? "" };
+				persist(ctx.sessionManager.getSessionId());
+				paint(ctx);
+				showRecapPanel(ctx);
+				if (ctx.hasUI) ctx.ui.notify(`主题已设为：${topic}`, "info");
+				return;
+			}
+
+			const force = arg.toLowerCase() === "redo";
 			if (recap && !force && !dirty && !summarizing && !queuedForce) {
 				showRecapPanel(ctx); // 零 token：直接读缓存
 				return;
@@ -529,6 +575,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (arg) {
 				recap = {
+					topic: recap?.topic ?? "",
 					label: clip(cleanPhrase(arg), MAX_SUMMARY_CHARS),
 					did: recap?.did ?? "",
 					next: recap?.next ?? "",

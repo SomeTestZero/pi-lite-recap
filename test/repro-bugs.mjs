@@ -114,6 +114,39 @@ const check = (name, ok, detail) => {
     env.calls() === 1 && panelShown, `calls=${env.calls()} panel=${panelShown}`);
 }
 
+// ========== T5: 会话主题：自动概括 + 粘性保持 + 手动覆盖 + 标题格式 ==========
+{
+  let n = 0;
+  const env = await makeEnv({
+    sessId: 'sess-t5',
+    completeImpl: async () => {
+      n++;
+      return { content: [{ type: 'text', text: n === 1
+        ? '主题：recap 插件\n标签：写小结功能\n做了：T5 一\n接下来：T5 二'
+        : '标签：继续修\n做了：T5 三\n接下来：T5 四' }] };
+    },
+  });
+  await env.h.message_end({ message: { role: 'user', content: [{ type: 'text', text: '任务五A：给 pi-lite-recap 加主题字段' }] } }, env.ctx);
+  await env.h.agent_settled({}, env.ctx);
+  await sleep(300);
+  const rec1 = storeOf('sess-t5');
+  const title1 = env.titles.at(-1);
+  // 第二轮：模型不再给主题 → 必须粘住旧主题
+  await env.h.message_end({ message: { role: 'user', content: [{ type: 'text', text: '任务五B 继续' }] } }, env.ctx);
+  await env.h.agent_settled({}, env.ctx);
+  await sleep(300);
+  const rec2 = storeOf('sess-t5');
+  // 手动改主题 → 立即生效（零 token）
+  await env.h['cmd:recap']('topic 换个主题', env.ctx);
+  const title3 = env.titles.at(-1);
+  const panel3 = env.widgets.at(-1)?.[1] ?? [];
+  check('T5 主题概括+粘性+手动覆盖+标题「主题 · 最近」',
+    rec1.topic === 'recap 插件' && title1 === 'recap 插件 · 写小结功能'
+    && rec2.topic === 'recap 插件' && rec2.label === '继续修'
+    && title3 === '换个主题 · 继续修' && panel3.some((l) => l.includes('◎ 主题：换个主题')),
+    `topic1=${rec1.topic} title1=${title1} topic2=${rec2.topic} label2=${rec2.label} title3=${title3}`);
+}
+
 function ctxOf(env) { return env.ctx; }
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);
